@@ -1,0 +1,372 @@
+#!/bin/bash
+# VPN Gateway Router Management Script
+# Provides easy commands to manage, troubleshoot, and monitor the VPN gateway
+#
+# Usage: sudo ./manage-vpn-gateway.sh [command]
+
+set -e
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+
+check_root() {
+    if [[ $EUID -ne 0 ]]; then
+        echo -e "${RED}This script must be run as root (use sudo)${NC}"
+        exit 1
+    fi
+}
+
+show_status() {
+    echo -e "${BLUE}=== VPN Gateway Status ===${NC}"
+    echo ""
+    
+    echo "Service Status:"
+    for service in hostapd dnsmasq wg-quick@wg0 openvpn@client; do
+        if systemctl list-unit-files | grep -q "^$service"; then
+            if systemctl is-active --quiet $service; then
+                echo -e "  $service: ${GREEN}✓ Running${NC}"
+            else
+                echo -e "  $service: ${RED}✗ Stopped${NC}"
+            fi
+        fi
+    done
+    
+    echo ""
+    echo "Network Interfaces:"
+    ip -brief addr show | grep -v "lo"
+    
+    echo ""
+    echo "Connected Clients:"
+    if systemctl is-active --quiet dnsmasq; then
+        cat /var/lib/misc/dnsmasq.leases 2>/dev/null || echo "  No active leases"
+    else
+        echo "  dnsmasq not running"
+    fi
+    
+    echo ""
+    if systemctl is-active --quiet wg-quick@wg0; then
+        echo "WireGuard Status:"
+        wg show
+    fi
+    
+    echo ""
+    echo "Routing Table:"
+    ip route | head -10
+}
+
+show_logs() {
+    service=${1:-hostapd}
+    echo -e "${BLUE}=== Logs for $service ===${NC}"
+    journalctl -u $service -n 50 --no-pager
+}
+
+follow_logs() {
+    echo -e "${BLUE}=== Following all VPN Gateway logs (Ctrl+C to stop) ===${NC}"
+    journalctl -u hostapd -u dnsmasq -u wg-quick@wg0 -u openvpn@client -f
+}
+
+restart_services() {
+    echo -e "${YELLOW}Restarting all VPN Gateway services...${NC}"
+    
+    systemctl restart vpn-gateway-init 2>/dev/null || true
+    sleep 1
+    
+    if systemctl list-unit-files | grep -q "wg-quick@wg0"; then
+        systemctl restart wg-quick@wg0
+    fi
+    
+    if systemctl list-unit-files | grep -q "openvpn@client"; then
+        systemctl restart openvpn@client
+    fi
+    
+    sleep 2
+    systemctl restart dnsmasq
+    sleep 1
+    systemctl restart hostapd
+    
+    echo -e "${GREEN}Services restarted${NC}"
+    show_status
+}
+
+stop_services() {
+    echo -e "${YELLOW}Stopping all VPN Gateway services...${NC}"
+    
+    systemctl stop hostapd 2>/dev/null || true
+    systemctl stop dnsmasq 2>/dev/null || true
+    systemctl stop wg-quick@wg0 2>/dev/null || true
+    systemctl stop openvpn@client 2>/dev/null || true
+    
+    echo -e "${GREEN}Services stopped${NC}"
+}
+
+start_services() {
+    echo -e "${YELLOW}Starting all VPN Gateway services...${NC}"
+    
+    systemctl enable --now vpn-gateway-init 2>/dev/null || true
+    sleep 1
+    
+    if systemctl list-unit-files | grep -q "wg-quick@wg0"; then
+        systemctl enable --now wg-quick@wg0
+    fi
+    
+    if systemctl list-unit-files | grep -q "openvpn@client"; then
+        systemctl enable --now openvpn@client
+    fi
+    
+    sleep 2
+    systemctl enable --now dnsmasq
+    sleep 1
+    systemctl enable --now hostapd
+    
+    echo -e "${GREEN}Services started${NC}"
+    show_status
+}
+
+show_iptables() {
+    echo -e "${BLUE}=== NAT Rules ===${NC}"
+    iptables -t nat -L -n -v
+    
+    echo ""
+    echo -e "${BLUE}=== Filter Rules ===${NC}"
+    iptables -L FORWARD -n -v
+}
+
+test_vpn() {
+    echo -e "${BLUE}=== VPN Connection Test ===${NC}"
+    echo ""
+    
+    if systemctl is-active --quiet wg-quick@wg0; then
+        echo "WireGuard interface:"
+        wg show wg0
+        echo ""
+        
+        echo "Testing VPN connectivity..."
+        if timeout 5 ping -c 3 -I wg0 1.1.1.1 &>/dev/null; then
+            echo -e "${GREEN}✓ VPN connection is working${NC}"
+            
+            echo ""
+            echo "Your VPN IP:"
+            curl -s --interface wg0 ifconfig.me
+            echo ""
+        else
+            echo -e "${RED}✗ VPN connection failed${NC}"
+        fi
+    elif systemctl is-active --quiet openvpn@client; then
+        echo "OpenVPN interface:"
+        ip addr show tun0
+        echo ""
+        
+        echo "Testing VPN connectivity..."
+        if timeout 5 ping -c 3 -I tun0 1.1.1.1 &>/dev/null; then
+            echo -e "${GREEN}✓ VPN connection is working${NC}"
+            
+            echo ""
+            echo "Your VPN IP:"
+            curl -s --interface tun0 ifconfig.me
+            echo ""
+        else
+            echo -e "${RED}✗ VPN connection failed${NC}"
+        fi
+    else
+        echo -e "${RED}No VPN service is running${NC}"
+    fi
+}
+
+show_clients() {
+    echo -e "${BLUE}=== Connected Clients ===${NC}"
+    echo ""
+    
+    if [[ -f /var/lib/misc/dnsmasq.leases ]]; then
+        echo "DHCP Leases:"
+        echo "----------------------------------------"
+        printf "%-15s %-17s %-20s %s\n" "IP Address" "MAC Address" "Hostname" "Expires"
+        echo "----------------------------------------"
+        
+        while read line; do
+            timestamp=$(echo $line | awk '{print $1}')
+            mac=$(echo $line | awk '{print $2}')
+            ip=$(echo $line | awk '{print $3}')
+            hostname=$(echo $line | awk '{print $4}')
+            
+            expires=$(date -d @$timestamp 2>/dev/null || echo "Unknown")
+            printf "%-15s %-17s %-20s %s\n" "$ip" "$mac" "$hostname" "$expires"
+        done < /var/lib/misc/dnsmasq.leases
+    else
+        echo "No DHCP leases file found"
+    fi
+    
+    echo ""
+    echo "Active Connections (hostapd):"
+    if systemctl is-active --quiet hostapd; then
+        # Try to get station info
+        iface=$(grep "^interface=" /etc/hostapd/hostapd.conf | cut -d= -f2)
+        if [[ -n "$iface" ]]; then
+            iw dev $iface station dump 2>/dev/null | grep -E "^Station|signal|rx bitrate|tx bitrate" || echo "No stations connected"
+        fi
+    else
+        echo "hostapd not running"
+    fi
+}
+
+check_dns() {
+    echo -e "${BLUE}=== DNS Configuration Check ===${NC}"
+    echo ""
+    
+    echo "System DNS configuration:"
+    cat /etc/resolv.conf
+    
+    echo ""
+    echo "dnsmasq configuration:"
+    grep -E "^server=|^dhcp-option=6" /etc/dnsmasq.conf 2>/dev/null || echo "Not configured"
+    
+    echo ""
+    echo "Testing DNS resolution:"
+    if host google.com &>/dev/null; then
+        echo -e "${GREEN}✓ DNS is working${NC}"
+    else
+        echo -e "${RED}✗ DNS resolution failed${NC}"
+    fi
+}
+
+bandwidth_monitor() {
+    iface=$(grep "^interface=" /etc/hostapd/hostapd.conf | cut -d= -f2)
+    
+    echo -e "${BLUE}=== Bandwidth Monitor (Ctrl+C to stop) ===${NC}"
+    echo "Monitoring interface: $iface"
+    echo ""
+    
+    iftop -i $iface 2>/dev/null || vnstat -l -i $iface 2>/dev/null || {
+        echo "Neither iftop nor vnstat is installed"
+        echo "Install with: apt-get install iftop"
+        echo ""
+        echo "Showing basic stats:"
+        watch -n 1 "ip -s link show $iface"
+    }
+}
+
+show_config() {
+    echo -e "${BLUE}=== Configuration Files ===${NC}"
+    echo ""
+    
+    echo "hostapd.conf:"
+    echo "----------------------------------------"
+    cat /etc/hostapd/hostapd.conf
+    
+    echo ""
+    echo "dnsmasq.conf:"
+    echo "----------------------------------------"
+    cat /etc/dnsmasq.conf
+    
+    if [[ -f /etc/wireguard/wg0.conf ]]; then
+        echo ""
+        echo "wireguard wg0.conf:"
+        echo "----------------------------------------"
+        # Don't show private key
+        grep -v "PrivateKey" /etc/wireguard/wg0.conf
+    fi
+}
+
+backup_config() {
+    backup_dir="/root/vpn-gateway-backup-$(date +%Y%m%d-%H%M%S)"
+    mkdir -p "$backup_dir"
+    
+    echo -e "${YELLOW}Creating backup in $backup_dir${NC}"
+    
+    cp /etc/hostapd/hostapd.conf "$backup_dir/" 2>/dev/null || true
+    cp /etc/dnsmasq.conf "$backup_dir/" 2>/dev/null || true
+    cp -r /etc/wireguard "$backup_dir/" 2>/dev/null || true
+    cp -r /etc/openvpn "$backup_dir/" 2>/dev/null || true
+    cp /etc/sysctl.d/99-vpn-router.conf "$backup_dir/" 2>/dev/null || true
+    iptables-save > "$backup_dir/iptables.rules"
+    
+    echo -e "${GREEN}Backup created successfully${NC}"
+    echo "Location: $backup_dir"
+}
+
+show_help() {
+    echo "VPN Gateway Router Management Tool"
+    echo ""
+    echo "Usage: sudo $0 [command]"
+    echo ""
+    echo "Commands:"
+    echo "  status          - Show status of all services and connections"
+    echo "  start           - Start all VPN gateway services"
+    echo "  stop            - Stop all VPN gateway services"
+    echo "  restart         - Restart all VPN gateway services"
+    echo "  logs [service]  - Show logs (default: hostapd)"
+    echo "  follow          - Follow logs in real-time"
+    echo "  clients         - Show connected clients"
+    echo "  vpn-test        - Test VPN connection"
+    echo "  iptables        - Show firewall rules"
+    echo "  dns             - Check DNS configuration"
+    echo "  config          - Show all configuration files"
+    echo "  backup          - Backup configuration files"
+    echo "  monitor         - Monitor bandwidth (requires iftop)"
+    echo "  help            - Show this help message"
+    echo ""
+    echo "Examples:"
+    echo "  $0 status"
+    echo "  $0 logs dnsmasq"
+    echo "  $0 clients"
+}
+
+# Main execution
+main() {
+    check_root
+    
+    case "${1:-status}" in
+        status)
+            show_status
+            ;;
+        start)
+            start_services
+            ;;
+        stop)
+            stop_services
+            ;;
+        restart)
+            restart_services
+            ;;
+        logs)
+            show_logs "$2"
+            ;;
+        follow)
+            follow_logs
+            ;;
+        clients)
+            show_clients
+            ;;
+        vpn-test|test)
+            test_vpn
+            ;;
+        iptables)
+            show_iptables
+            ;;
+        dns)
+            check_dns
+            ;;
+        config)
+            show_config
+            ;;
+        backup)
+            backup_config
+            ;;
+        monitor|bandwidth)
+            bandwidth_monitor
+            ;;
+        help|--help|-h)
+            show_help
+            ;;
+        *)
+            echo -e "${RED}Unknown command: $1${NC}"
+            echo ""
+            show_help
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"
